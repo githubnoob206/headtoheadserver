@@ -20,18 +20,27 @@ const ACTIONS = new Set(['left', 'right', 'jump']);
 const MAX_LOBBIES = 100;
 
 app.disable('x-powered-by');
-app.get('/health', (_req, res) => res.json({ ok: true, openLobbies: publicLobbyList().length }));
+app.get('/health', (_req, res) =>
+  res.json({ ok: true, openLobbies: publicLobbyList().length })
+);
 app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
 function cleanName(value) {
-  const name = String(value || 'Player').replace(/[<>\u0000-\u001f]/g, '').trim().slice(0, 20);
+  const name = String(value || 'Player')
+    .replace(/[<>\u0000-\u001f]/g, '')
+    .trim()
+    .slice(0, 20);
   return name || 'Player';
 }
 
 function publicLobbyList() {
   return [...rooms.values()]
     .filter(room => !room.started && room.players.length === 1)
-    .map(room => ({ roomId: room.id, name: room.players[0].name, count: 1 }));
+    .map(room => ({
+      roomId: room.id,
+      name: room.players[0].name,
+      count: 1
+    }));
 }
 
 function broadcastLobbies() {
@@ -61,12 +70,14 @@ function removePlayer(socket, roomId, notify = true) {
   if (notify) io.to(roomId).emit('opponentLeft');
 
   if (room.players.length === 0) {
+    if (room.roundTimer) clearTimeout(room.roundTimer);
     rooms.delete(roomId);
     io.to(roomId).emit('lobbyClosed');
   } else {
     // A remaining player can keep the public lobby open and become its host.
     room.hostSocketId = room.players[0].socketId;
     room.started = false;
+    if (room.roundTimer) clearTimeout(room.roundTimer);
     room.players[0].playerIndex = 0;
     io.to(room.players[0].socketId).emit('hostChanged');
     sendRoomChanged(room);
@@ -79,10 +90,14 @@ io.on('connection', socket => {
   socket.data.roomId = null;
   socket.emit('lobbyList', publicLobbyList());
 
-  socket.on('listLobbies', () => socket.emit('lobbyList', publicLobbyList()));
+  socket.on('listLobbies', () => {
+    socket.emit('lobbyList', publicLobbyList());
+  });
 
   socket.on('createLobby', payload => {
-    if (socket.data.roomId) removePlayer(socket, socket.data.roomId, false);
+    if (socket.data.roomId) {
+      removePlayer(socket, socket.data.roomId, false);
+    }
 
     if (rooms.size >= MAX_LOBBIES) {
       socket.emit('lobbyError', {
@@ -91,7 +106,10 @@ io.on('connection', socket => {
       return;
     }
 
-    const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+    const id = `${Date.now().toString(36)}-${Math.random()
+      .toString(36)
+      .slice(2, 9)}`;
+
     const room = {
       id,
       hostSocketId: socket.id,
@@ -100,7 +118,13 @@ io.on('connection', socket => {
         name: cleanName(payload?.name),
         playerIndex: 0
       }],
-      started: false
+      started: false,
+      bombHolder: null,
+      bombSeq: 0,
+      scores: [0, 0],
+      nextPassAt: 0,
+      bombEndsAt: 0,
+      roundTimer: null
     };
 
     rooms.set(id, room);
@@ -126,7 +150,9 @@ io.on('connection', socket => {
       return;
     }
 
-    if (socket.data.roomId) removePlayer(socket, socket.data.roomId, false);
+    if (socket.data.roomId) {
+      removePlayer(socket, socket.data.roomId, false);
+    }
 
     room.players.push({
       socketId: socket.id,
@@ -148,15 +174,28 @@ io.on('connection', socket => {
   socket.on('startGame', payload => {
     const room = rooms.get(String(payload?.roomId || ''));
 
-    if (!room || room.hostSocketId !== socket.id || room.players.length !== 2 || room.started) {
+    if (
+      !room ||
+      room.hostSocketId !== socket.id ||
+      room.players.length !== 2 ||
+      room.started
+    ) {
       return;
     }
 
     room.started = true;
-    const holder = Number(payload?.bombHolder) === 1 ? 1 : 0;
+    room.bombHolder = Number(payload?.bombHolder) === 1 ? 1 : 0;
+    room.bombSeq = 0;
+    room.scores = [0, 0];
+    room.nextPassAt = Date.now() + 1000;
+    room.bombEndsAt = Date.now() + 10000;
+
     io.to(room.id).emit('gameStarted', {
       roomId: room.id,
-      bombHolder: holder
+      bombHolder: room.bombHolder,
+      seq: room.bombSeq,
+      passLockMs: 1000,
+      bombTimeMs: 10000
     });
     broadcastLobbies();
   });
@@ -174,36 +213,135 @@ io.on('connection', socket => {
     });
   });
 
-  socket.on('gameState', payload => {
+  socket.on('playerState', payload => {
     const roomId = socket.data.roomId;
     const room = roomId && rooms.get(roomId);
 
-    if (!room || !room.started || room.hostSocketId !== socket.id) return;
-    if (!Number.isFinite(payload?.time) ||
-        !Array.isArray(payload?.cubes) ||
-        payload.cubes.length !== 2) {
+    if (!room || !room.started) return;
+
+    const player = room.players.find(p => p.socketId === socket.id);
+    const source = payload?.state;
+
+    if (!player || !source ||
+        !Number.isFinite(source.x) ||
+        !Number.isFinite(source.h)) {
       return;
     }
 
-    socket.to(roomId).emit('gameState', {
+    const state = {};
+    for (const key of [
+      'x', 'h', 'vx', 'vy', 'angle', 'air',
+      'spin', 'jumpIn', 'deadIn', 'shieldIn'
+    ]) {
+      if (Number.isFinite(source[key])) {
+        state[key] = source[key];
+      }
+    }
+
+    socket.to(roomId).emit('playerState', {
       roomId,
-      time: payload.time,
-      scores: Array.isArray(payload.scores) ? payload.scores.slice(0, 2) : [0, 0],
-      bombHolder: payload.bombHolder,
-      bombTime: payload.bombTime,
-      passLockUntil: payload.passLockUntil,
-      bombRoundEnd: payload.bombRoundEnd,
-      cubes: payload.cubes
+      playerIndex: player.playerIndex,
+      state
     });
+  });
+
+  socket.on('bombPass', payload => {
+    const roomId = socket.data.roomId;
+    const room = roomId && rooms.get(roomId);
+
+    if (!room || !room.started ||
+        !room.players.some(p => p.socketId === socket.id)) {
+      return;
+    }
+
+    const now = Date.now();
+
+    if (
+      payload?.fromHolder !== room.bombHolder ||
+      payload?.seq !== room.bombSeq ||
+      now < room.nextPassAt
+    ) {
+      socket.emit('bombState', {
+        roomId,
+        holder: room.bombHolder,
+        seq: room.bombSeq,
+        passLockMs: Math.max(0, room.nextPassAt - now),
+        bombTimeMs: Math.max(0, room.bombEndsAt - now)
+      });
+      return;
+    }
+
+    room.bombHolder = 1 - room.bombHolder;
+    room.bombSeq++;
+    room.nextPassAt = now + 1000;
+    room.bombEndsAt = now + 10000;
+
+    io.to(roomId).emit('bombState', {
+      roomId,
+      holder: room.bombHolder,
+      seq: room.bombSeq,
+      passLockMs: 1000,
+      bombTimeMs: 10000
+    });
+  });
+
+  socket.on('bombExploded', payload => {
+    const roomId = socket.data.roomId;
+    const room = roomId && rooms.get(roomId);
+
+    if (
+      !room ||
+      !room.started ||
+      payload?.holder !== room.bombHolder ||
+      payload?.seq !== room.bombSeq
+    ) {
+      return;
+    }
+
+    if (Date.now() < room.bombEndsAt) return;
+
+    room.scores[1 - room.bombHolder]++;
+    room.bombHolder = -1;
+
+    io.to(roomId).emit('roundEnded', {
+      roomId,
+      scores: room.scores
+    });
+
+    if (room.roundTimer) clearTimeout(room.roundTimer);
+
+    room.roundTimer = setTimeout(() => {
+      if (!rooms.has(roomId) || !room.started || room.players.length !== 2) {
+        return;
+      }
+
+      room.bombSeq++;
+      room.bombHolder = (room.scores[0] + room.scores[1]) % 2;
+      room.nextPassAt = Date.now() + 1000;
+      room.bombEndsAt = Date.now() + 10000;
+
+      io.to(roomId).emit('newRound', {
+        roomId,
+        scores: room.scores,
+        bombHolder: room.bombHolder,
+        seq: room.bombSeq,
+        passLockMs: 1000,
+        bombTimeMs: 10000
+      });
+    }, 1500);
   });
 
   socket.on('leaveLobby', payload => {
     const roomId = String(payload?.roomId || socket.data.roomId || '');
-    if (socket.data.roomId === roomId) removePlayer(socket, roomId);
+    if (socket.data.roomId === roomId) {
+      removePlayer(socket, roomId);
+    }
   });
 
   socket.on('disconnect', () => {
-    if (socket.data.roomId) removePlayer(socket, socket.data.roomId);
+    if (socket.data.roomId) {
+      removePlayer(socket, socket.data.roomId);
+    }
   });
 });
 
